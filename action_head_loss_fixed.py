@@ -1,360 +1,426 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-" Train from the replay files through python tensor (pt) file"
+"Library for SL losses for mutli-gpu."
 
-import os
-python_file_path= os.path.dirname(os.path.abspath(__file__))
-print(python_file_path)
-import gc
-
-import sys
-import time
 import traceback
-import argparse
-import datetime
 
 import numpy as np
+
 import torch
 import torch.nn as nn
 
-from torch.utils.data import DataLoader, ConcatDataset, random_split
-from torch.optim import Adam, RMSprop
-from torch.optim.lr_scheduler import StepLR
-import tensordict
-
-from tensorboardX import SummaryWriter
-
-from absl import flags
-from absl import app
-from tqdm import tqdm
-import copy
-import matplotlib.pyplot as plt
-
-from alphastarmini.core.arch.arch_model import ArchModel
+from pysc2.lib.actions import RAW_FUNCTIONS as F
 
 from alphastarmini.core.sl.feature import Feature
 from alphastarmini.core.sl.label import Label
-from alphastarmini.core.sl import sl_loss_multi_gpu as Loss
-from alphastarmini.core.sl.dataset import ReplayTensorDataset
 from alphastarmini.core.sl import sl_utils as SU
 
-from alphastarmini.lib.utils import load_latest_model, initial_model_state_dict
-
 from alphastarmini.lib.hyper_parameters import Arch_Hyper_Parameters as AHP
-from alphastarmini.lib.hyper_parameters import SL_Training_Hyper_Parameters as SLTHP
+from alphastarmini.lib.hyper_parameters import Label_Size as LS
 from alphastarmini.lib.hyper_parameters import StarCraft_Hyper_Parameters as SCHP
 
-import param as P
+from alphastarmini.lib import utils as L
 
 __author__ = "Ruo-Ze Liu"
 
-class CustomDataset:
-    """
-    Custom Dataset class which read data tuples from disk
-    only when it is needed.
-
-    :param file_location: Relative path to the files.
-    :param file_num: The number of files.
-    :param file_size: The number of data in one file.
-    :param replay_files: The names of all the replay files.
-    """
-    def __init__(self, file_location, file_num, file_size, replay_files):
-        super(CustomDataset, self).__init__()
-
-        self.file_location = file_location
-        self.file_num = file_num
-        self.file_size = file_size
-        self.replay_files = replay_files
-
-    def __getitem__(self, idx):
-
-        feature_lst = []
-        label_lst = []
-
-        for temp_idx in range(idx, idx+SEQ_LEN):
-            replay_file = self.replay_files[temp_idx]
-            replay_path = self.file_location + replay_file
-            start_load = time.time()
-            try:
-                temp = torch.load(replay_path)
-                feature, label = temp
-            except RuntimeError:
-                print(f"s,a file {replay_file} damaged.")
-                return None
-                feature, label = copy.deepcopy(feature), copy.deepcopy(label)
-            except EOFError:
-                print(f"s,a file {replay_file} is empty.")
-                return None
-                feature, label = copy.deepcopy(feature), copy.deepcopy(label)
-            # print(f"single load time: {time.time() - start_load}, file: {replay_file}")
-            feature_lst.extend([feature])
-            label_lst.extend([label])
-        
-        feature_tensor = torch.concat(feature_lst)
-        label_tensor = torch.concat(label_lst)
-        
-        return feature_tensor, label_tensor
-
-    def __len__(self):
-        return self.file_num * self.file_size
-
-def collate_fn(batch):
-    batch = list(filter(lambda x: x is not None, batch))
-    return torch.utils.data.dataloader.default_collate(batch)
-
 debug = False
 
-parser = argparse.ArgumentParser()
-parser.add_argument("-p1", "--path1", default="/sc2-dataset/RushBuild_tensor/", help="The path where data stored")
-parser.add_argument("-p2", "--path2", default="./data/replay_data_tensor_new_small_AR/", help="The path where data stored")
-parser.add_argument("-p3", "--path3", default="./data/replay_data_tensor_2019wcs_10m_step/", help="The path where data stored")
-parser.add_argument("-m", "--model", choices=["sl", "rl"], default="sl", help="Choose model type")
-parser.add_argument("-r", "--restore", action="store_true", default=False, help="whether to restore model or not")
-parser.add_argument("-c", "--clip", action="store_true", default=False, help="whether to use clipping")
-parser.add_argument('--num_workers', type=int, default=3, help='')
+
+# criterion = nn.CrossEntropyLoss()
+# due to CrossEntropyLoss only accepts loss with lables.shape = [N]
+# we define a loss accept soft_target, which label.shape = [N, C]
+# for some rows, it should not be added to loss, so we also need a mask one
+def cross_entropy(soft_targets, pred, mask=None, 
+                  debug=False, outlier_remove=True, 
+                  entity_nums=None, select_size=None,
+                  select_units_num=None, use_select_size=True,
+                  avg_type='None'):
+    # class is always in the last dim
+    logsoftmax = nn.LogSoftmax(dim=-1)
+    x_1 = - soft_targets * logsoftmax(pred)
+
+    if debug:
+        for i, (t, p) in enumerate(zip(soft_targets, logsoftmax(pred))):
+            # print('t', t)
+            # print('t.shape', t.shape)
+            # print('p', p)
+            # print('p.shape', p.shape)
+            value = - t * logsoftmax(p)
+            # print('value', value)
+            # print('value.shape', value.shape)
+            m = mask[i].item()
+            if value.sum() > 1e6 and m != 0:
+                print('i', i)
+                if entity_nums is not None:
+                    if use_select_size and select_size is not None and select_units_num is not None:
+                        i_1 = int(i / select_size)
+                        print('i_1', i_1)
+                        i_2 = i - i_1 * select_size
+                        print('i_2', i_2)
+                        print('entity_nums[i_1]', entity_nums[i_1])
+                        print('select_units_num[i_1]', select_units_num[i_1])
+                    else:
+                        print('entity_nums[i]', entity_nums[i])
+
+                print('find value large than 1e6')
+                print('t', t)
+                z = torch.nonzero(t, as_tuple=True)[-1]
+                print('z', z)
+                idx = z.item()
+                print('p', p)
+                q = p[idx]
+                print('q', q)
+                print('value', value)
+                print('m', m)
+                stop()
+
+    print('x_1:', x_1) if debug else None
+    print('x_1.shape:', x_1.shape) if debug else None
+
+    x_2 = torch.sum(x_1, -1)
+    print('x_2:', x_2) if debug else None
+    print('x_2.shape:', x_2.shape) if debug else None
+
+    # This mask is for each item's mask
+    if mask is not None:
+        x_2 = x_2 * mask
+
+        if outlier_remove:
+            outlier_mask = (x_2 >= 1e6)
+            x_2 = x_2 * ~outlier_mask
+        else:
+            outlier_mask = (x_2 >= 1e6)
+            if outlier_mask.any() > 0:
+                stop()
+
+    if use_select_size and select_size is not None and select_units_num is not None:
+        x_2 = x_2.reshape(-1, select_size)
+        x_2 = torch.sum(x_2, dim=-1, keepdim=True)
+
+        avg_type = 'None'
+
+        if avg_type == 'None':
+            x_2 = x_2  # increase the multi unit weight
+        elif avg_type == 'PrefSingle':
+            x_2 / select_units_num.unsqueeze(dim=1)  # increase the single unit weight
+        elif avg_type == 'Log':
+            x_2 = x_2 / (torch.log(select_units_num.unsqueeze(dim=1).float()) + 1e-9)
+        elif avg_type == 'Sqrt':
+            x_2 = x_2 / torch.sqrt(select_units_num.unsqueeze(dim=1).float())
+        else:
+            x_2 = x_2
+
+    x_4 = torch.mean(x_2)
+    print('x_4:', x_4) if debug else None
+    print('x_4.shape:', x_4.shape) if debug else None
+
+    return x_4
 
 
-args = parser.parse_args()
+def get_sl_loss(traj_batch, model, use_mask=True, use_eval=False):
+    criterion = cross_entropy
 
-# training paramerters
-if SCHP.map_name == 'Simple64':
-    PATH = args.path1
-elif SCHP.map_name == 'AbyssalReef':
-    PATH = args.path2
-else:
-    PATH = args.path3
+    loss = 0
+    feature_size = Feature.getSize()
+    label_size = Label.getSize()
 
-#PATH = './temp/'
+    print('traj_batch.shape:', traj_batch.shape) if debug else None
+    batch_size = traj_batch.shape[0]
+    seq_len = traj_batch.shape[1]
 
-SAVE_STATE_DICT = True
-MODEL_PATH = "./model/"
-MODEL = "sl"
-if not os.path.exists(MODEL_PATH):
-    os.mkdir(MODEL_PATH)
+    feature = traj_batch[:, :, :feature_size].reshape(batch_size * seq_len, feature_size)
+    label = traj_batch[:, :, feature_size:feature_size + label_size].reshape(batch_size * seq_len, label_size)
+    is_final = traj_batch[:, :, -1:]
 
-print(PATH)
+    state = Feature.feature2state(feature)
+    print('state:', state) if debug else None
+
+    action_gt = Label.label2action(label)
+    print('action_gt:', action_gt) if debug else None
+
+    device = next(model.parameters()).device
+    print("model.device:", device) if debug else None
+
+    # state.to(device)
+    # print('state:', state) if debug else None
+
+    # action_gt.to(device)
+    # print('action_gt:', action_gt) if debug else None
+
+    loss = torch.tensor([0.])
+    loss_list = [0., 0., 0., 0., 0., 0.]
+    acc_num_list = [0., 0., 0., 0., 0., 0.]    
+
+    # we can't make them all into as a list or into ArgsActionLogits
+    # if we do that, the pytorch DDP will cause a runtime error, just like the loss don't include all parameters
+    # This error is strange, so we choose to use a specific loss writing schema for multi-gpu calculation.
+    action_pred, entity_nums, units, target_unit, target_location, action_type_logits, \
+        delay_logits, queue_logits, \
+        units_logits, target_unit_logits, \
+        target_location_logits, select_units_num = model.forward(state, batch_size=batch_size, 
+                                                                 sequence_length=seq_len, multi_gpu_supvised_learning=True)
+
+    print('action_pred.shape', action_pred.shape) if debug else None   
+
+    loss, loss_list = get_masked_classify_loss_for_multi_gpu(action_gt, action_pred, entity_nums, action_type_logits,
+                                                             delay_logits, queue_logits, units_logits,
+                                                             target_unit_logits, target_location_logits, 
+                                                             select_units_num, criterion, device)
+
+    acc_num_list = SU.get_accuracy(action_gt.action_type, action_pred, device)
+
+    print('loss', loss) if debug else None
+
+    return loss, loss_list, acc_num_list
+
+
+def get_sl_loss_for_tensor(features, labels, model, decrease_smart_opertaion=False,
+                           return_important=False, only_consider_small=False,
+                           train=True, use_masked_loss=True):
     
-NUM_WORKERS = args.num_workers
-
-SIMPLE_TEST = not P.on_server
-
-# hyper paramerters
-# use the same as in RL
-
-# important: use larger batch_size and smaller seq_len in SL!
-BATCH_SIZE = 64#3 * AHP.batch_size
-SEQ_LEN = int(AHP.sequence_length * 0.5)
-
-print('BATCH_SIZE:', BATCH_SIZE) if debug else None
-print('SEQ_LEN:', SEQ_LEN) if debug else None
-
-#REPLAY_RATIO = 0.6
-NUM_EPOCHS = 10
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-5
-STEP_SIZE = 50
-GAMMA = 0.2
-
-torch.manual_seed(SLTHP.seed)
-np.random.seed(SLTHP.seed)
-
-def main_worker(device):#, used, cnt):
-    print('==> Making model..')
-    net = ArchModel()
-    # net.load_state_dict(torch.load("./model/sl_24-02-12_19-59-12.pth"))
-    checkpoint = None
+    criterion = cross_entropy
     
-    net = net.to(device)
+    batch_size = features.shape[0]
+    seq_len = features.shape[1]
 
-    num_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print('The number of parameters of model is', num_params)
+    assert batch_size == labels.shape[0]
+    assert seq_len == labels.shape[1]
 
-    print('==> Making optimizer and scheduler..')
+    features = features.reshape(batch_size * seq_len, -1)
+    labels = labels.reshape(batch_size * seq_len, -1)
 
-    optimizer = Adam(net.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = StepLR(optimizer, step_size=STEP_SIZE, gamma=GAMMA)
+    state = Feature.feature2state(features)
+    print('state:', state) if debug else None
 
-    print('==> Preparing data..')
+    action_gt = Label.label2action(labels)
+    print('action_gt:', action_gt) if debug else None
 
-    replay_files = os.listdir(PATH)
+    device = next(model.parameters()).device
+    print("model.device:", device) if debug else None
 
-    import natsort
-    
-    print('length of replay_files:', len(replay_files)) if debug else None
-    replay_files.sort()
-    replay_files = natsort.natsorted(replay_files)
+    # state.to(device)
+    # print('state:', state) if debug else None
 
-    dataset = CustomDataset(
-        PATH, 
-        len(replay_files)-SEQ_LEN,
-        1,
-        replay_files
-        )
-    
-    dataset_size = len(dataset)
-    train_size = int(dataset_size * 0.8)
-    validation_size = dataset_size - train_size
-#    test_size = dataset_size - train_size - validation_size
+    # action_gt.to(device)
+    # print('action_gt:', action_gt) if debug else None
 
-    train_set, valid_set = random_split(dataset, [train_size, validation_size])
-   
-    train_loader = DataLoader(
-        dataset=train_set,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        drop_last=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=False,
-        collate_fn=collate_fn
-        )
-    
-    valid_loader = DataLoader(
-        dataset=valid_set,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        drop_last=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=False,
-        collate_fn=collate_fn
-        )
-    
-    return train(net, optimizer, scheduler, train_loader, valid_loader, device)
+    loss = torch.tensor([0.])
+    loss_list = [0., 0., 0., 0., 0., 0.]
+    acc_num_list = [0., 0., 0., 0., 0., 0.]    
 
-def train(net, optimizer, scheduler, train_loader, valid_loader, device):
-    
-    print('==> Preparing training..')
-    
-    time_str = time.strftime("%y-%m-%d_%H-%M-%S", time.localtime())
-    SAVE_PATH = os.path.join(MODEL_PATH, MODEL + "_" + time_str)
-    
-    print('==> start training..')
-    print('epoch:',NUM_EPOCHS)
-    print('batch_size:',BATCH_SIZE)
-    print('batch_num:',len(train_loader))
+    # we can't make them all into as a list or into ArgsActionLogits
+    # if we do that, the pytorch DDP will cause a runtime error, just like the loss don't include all parameters
+    # This error is strange, so we choose to use a specific loss writing schema for multi-gpu calculation.
+    if True:
+        if SCHP.map_name == 'Simple64':
+            smart_action_gt = torch.zeros(1, LS.action_type_encoding, device=device).float()
+            smart_action_gt[0, F.Smart_unit.id.value] = 1
 
-    start = time.time()
-    for ep in range(0,NUM_EPOCHS):
-        loss_sum = 0
-        batch_time = time.time()
+            gather_action_gt = torch.zeros(1, LS.action_type_encoding, device=device).float()
+            gather_action_gt[0, F.Harvest_Gather_unit.id.value] = 1
 
-        print_num = 100
-        # put model in train mode
-        net.train()
-        for batch_idx, train_batch in enumerate(train_loader):
+            action_gt.action_type[(action_gt.action_type == smart_action_gt).all(dim=-1).bool()] = gather_action_gt
 
-            features, labels = train_batch
-            print('features.shape:', features.shape) if batch_idx==0 else None
-            print('labels.shape::', labels.shape) if batch_idx==0 else None
-            # print('batch index: ', batch_idx)
-            
-            feature_tensor = features.to(device).float()
-            labels_tensor = labels.to(device).float()
-            del features, labels
-            
-            loss, loss_list, \
-                acc_num_list = Loss.get_sl_loss_for_tensor(feature_tensor, 
-                                                           labels_tensor, net, 
-                                                           decrease_smart_opertaion=True,
-                                                           return_important=True,
-                                                           only_consider_small=False,
-                                                           train=True)
+        gt_units = action_gt.units
+        units_size = gt_units.shape[-1]
 
-            action_accuracy = acc_num_list[0] / (acc_num_list[1] + 1e-9)
+        bias_action_gt = torch.zeros(1, 1, units_size, device=device).float()
+        bias_action_gt[0, 0, -1] = 1
 
-            loss_sum += loss.item()
-            
-            optimizer.zero_grad()
-            loss.backward() 
-            optimizer.step()
-            
-            if batch_idx % print_num == print_num-1:
-                print('Batch/Epoch: [{}/{}]| loss: {:.3f} | acc: {:.3f} | {} batch time: {:.3f}'.format(
-                    batch_idx+1, ep+1, loss_sum/print_num, action_accuracy, print_num, time.time() - batch_time))
-                loss_sum = 0
-                batch_time = time.time()
-                torch.cuda.empty_cache()
-                
-            
-            gc.collect()
-            
-            
-        if SAVE_STATE_DICT:
-            save_path = SAVE_PATH + ".pth"
-            print('Save model state_dict to', save_path)
-            torch.save(net.state_dict(), save_path)
-        
-        SU.action_recall = dict()
-        
-        scheduler.step()
-        
-        print('########## validation ###########')
-        
-        print_num = 25
-        loss_sum = 0
-        batch_time = time.time()
-        net.eval()
-        with torch.no_grad():
-            for batch_idx, valid_batch in enumerate(valid_loader):
-                features, labels = valid_batch
-                print('features.shape:', features.shape) if batch_idx==0 else None
-                print('labels.shape::', labels.shape) if batch_idx==0 else None
-                # print('batch index: ', batch_idx)
-                
-                feature_tensor = features.to(device).float()
-                labels_tensor = labels.to(device).float()
-                del features, labels
-                
-                loss, loss_list, \
-                    acc_num_list = Loss.get_sl_loss_for_tensor(feature_tensor, 
-                                                            labels_tensor, net, 
-                                                            decrease_smart_opertaion=True,
-                                                            return_important=True,
-                                                            only_consider_small=False,
-                                                            train=True)
+        gt_select_units_num = (~(action_gt.units == bias_action_gt).all(dim=-1)).sum(dim=-1)
 
-                action_accuracy = acc_num_list[0] / (acc_num_list[1] + 1e-9)
+        print('gt_select_units_num', gt_select_units_num) if debug else None
+        print('gt_select_units_num.shape', gt_select_units_num.shape) if debug else None
 
-                loss_sum += loss.item()
-                
-                action_recall = SU.action_recall
-                
-                if batch_idx % print_num == print_num-1:
-                    print('Batch/Epoch: [{}/{}]| loss: {:.3f} | acc: {:.3f} | {} batch time: {:.3f}'.format(
-                        batch_idx+1, ep+1, loss_sum/print_num, action_accuracy, print_num, time.time() - batch_time))
-                    loss_sum = 0
-                    batch_time = time.time()
+        action_pred, entity_nums, units, target_unit, target_location, action_type_logits, \
+            delay_logits, queue_logits, \
+            units_logits, target_unit_logits, \
+            target_location_logits, select_units_num, \
+            hidden_state, unit_types_one = model.mimic_forward(state, 
+                                                               action_gt, 
+                                                               gt_select_units_num,
+                                                               batch_size=batch_size, 
+                                                               sequence_length=seq_len, 
+                                                               multi_gpu_supvised_learning=True)
 
-            action_recall = SU.action_recall
+        if use_masked_loss:
+            # masked loss
+            loss, loss_list = get_masked_classify_loss_for_multi_gpu(action_gt, action_pred, entity_nums, action_type_logits,
+                                                                     delay_logits, queue_logits, units_logits,
+                                                                     target_unit_logits, target_location_logits, 
+                                                                     select_units_num, criterion, device, 
+                                                                     decrease_smart_opertaion=decrease_smart_opertaion,
+                                                                     only_consider_small=only_consider_small)    
+        else:
+            # noraml loss
+            loss, loss_list = get_classify_loss_for_multi_gpu(action_gt, action_type_logits,
+                                                              delay_logits, queue_logits, units_logits,
+                                                              target_unit_logits, target_location_logits, 
+                                                              criterion)
 
-            plt.figure()
-            keys = action_recall.keys()
-            recalls = [action_recall[key][0]/action_recall[key][1] for key in keys]
-            x = np.arange(len(keys))
-            plt.bar(x, recalls)
-            plt.xticks(x, keys, rotation=90)
-            plt.savefig(f"./outputs/action_recall_{ep+1}.png")
+    if True:
+        action_pred, entity_nums, units, target_unit, target_location, action_type_logits, \
+            delay_logits, queue_logits, \
+            units_logits, target_unit_logits, \
+            target_location_logits, select_units_num = model.forward(state, 
+                                                                     batch_size=batch_size, 
+                                                                     sequence_length=seq_len, 
+                                                                     multi_gpu_supvised_learning=True)
 
-        
-    print("training time:",time.time()-start)
-    return
+        acc_num_list, action_equal_mask = SU.get_accuracy(action_gt.action_type, action_pred, 
+                                                          device, return_important=return_important)
 
-def test():
+        location_acc = SU.get_location_accuracy(action_gt.target_location, target_location, action_equal_mask, device, 
+                                                strict_comparsion=True)
+        selected_acc = SU.get_selected_units_accuracy(action_gt.units, units, action_gt.action_type, action_pred,
+                                                      select_units_num, action_equal_mask,
+                                                      device, unit_types_one, entity_nums, strict_comparsion=True)
+        targeted_acc = SU.get_target_unit_accuracy(action_gt.target_unit, target_unit, action_equal_mask,
+                                                   device, strict_comparsion=True)
 
-    # gpu setting
-    ON_GPU = torch.cuda.is_available()
-    print("cuda.is_available:",ON_GPU)
-    DEVICE = torch.device("cuda:0" if ON_GPU else "cpu")
-    print("device:",DEVICE.type)
+        acc_num_list.extend(location_acc)
+        acc_num_list.extend(selected_acc)
+        acc_num_list.extend(targeted_acc)
 
-    if ON_GPU:
-        if torch.backends.cudnn.is_available():
-            print('cudnn available')
-            print('cudnn version', torch.backends.cudnn.version())
-            torch.backends.cudnn.enabled = True
-            torch.backends.cudnn.benchmark = True
-    
-    return main_worker(DEVICE)
+    return loss, loss_list, acc_num_list
 
-if __name__ == "__main__":
-    test()
+
+def get_masked_classify_loss_for_multi_gpu(action_gt, action_pred, entity_nums, action_type_logits, 
+                                           delay_logits, queue_logits, units_logits,
+                                           target_unit_logits, target_location_logits, select_units_num,
+                                           criterion, device, 
+                                           decrease_smart_opertaion=False,
+                                           only_consider_small=False,
+                                           strict_comparsion=True, remove_none=True):
+    loss = 0.
+    total_batch_size = entity_nums.shape[0]
+
+    # consider using move camera weight
+    move_camera_weight = SU.get_move_camera_weight_in_SL(action_gt.action_type, 
+                                                         action_pred, 
+                                                         device, 
+                                                         decrease_smart_opertaion=decrease_smart_opertaion,
+                                                         only_consider_small=only_consider_small).reshape(-1)
+    #move_camera_weight = None
+    action_type_loss = criterion(action_gt.action_type, action_type_logits, mask=move_camera_weight)
+    action_type_loss = action_type_loss.mean()
+    action_type_loss = (action_gt.action_type.shape[0] / total_batch_size) *action_type_loss
+    loss += action_type_loss
+
+    #mask_tensor = get_one_way_mask_in_SL(action_gt.action_type, device)
+    mask_tensor = SU.get_two_way_mask_in_SL(action_gt.action_type, action_pred, device, strict_comparsion=False)  # False
+
+    # we now onsider delay loss
+    delay_weight = 1.0
+    if AHP.use_predict_step_mul:
+        delay_weight = 1.0
+    delay_loss = delay_weight * criterion(action_gt.delay, delay_logits)
+    delay_loss = delay_loss.mean()
+    delay_loss = (action_gt.delay.shape[0] / total_batch_size) * delay_loss
+    loss += delay_loss
+
+    queue_loss = criterion(action_gt.queue, queue_logits, mask=mask_tensor[:, 2].reshape(-1))
+    queue_loss = queue_loss.mean()
+    queue_loss = (action_gt.queue.shape[0] / total_batch_size) * queue_loss
+    loss += queue_loss
+
+    batch_size = action_gt.units.shape[0]
+    select_size = action_gt.units.shape[1]
+    units_size = action_gt.units.shape[-1]
+
+    entity_nums = entity_nums
+    print('entity_nums', entity_nums) if debug else None
+    print('entity_nums.shape', entity_nums.shape) if debug else None
+
+    # use extended select_size in SL for including EOF
+    extended_select_size = select_size + 1
+
+    units_mask = mask_tensor[:, 3]  # selected units is in the fourth position of units_mask
+    units_mask = units_mask.unsqueeze(1).repeat(1, extended_select_size)
+    units_mask = units_mask.reshape(-1)
+    print('units_mask', units_mask) if debug else None
+    print('units_mask.shape', units_mask.shape) if debug else None
+
+    selected_mask = torch.arange(extended_select_size, device=device).float()
+    selected_mask = selected_mask.repeat(batch_size, 1)
+
+    # note, the select_units_num is actually gt_select_units_num here
+    # we extend select_units_num by 1 to include the EFO
+    selected_mask = selected_mask < (select_units_num + 1).unsqueeze(dim=1)
+    selected_mask = selected_mask.reshape(-1)
+    print('selected_mask', selected_mask) if debug else None
+    print('selected_mask.shape', selected_mask.shape) if debug else None
+
+    gt_units = action_gt.units.long()
+    padding = torch.zeros(batch_size, 1, units_size, dtype=gt_units.dtype, device=gt_units.device)
+    token = torch.tensor(AHP.max_entities - 1, dtype=padding.dtype, device=padding.device)
+    padding[:, 0] = L.tensor_one_hot(token, units_size).reshape(-1)
+    gt_units = torch.cat([gt_units, padding], dim=1)
+    print('gt_units', gt_units) if debug else None
+    print('gt_units.shape', gt_units.shape) if debug else None
+
+    gt_units[torch.arange(batch_size), select_units_num] = L.tensor_one_hot(entity_nums, units_size).long()
+    print('gt_units', gt_units) if debug else None
+    print('gt_units.shape', gt_units.shape) if debug else None
+
+    gt_units = gt_units.float()
+
+    all_units_mask = units_mask * selected_mask  # * gt_units_mask
+
+    # TODO: change to a proporate calculation of selected units
+    # selected_units_weight = 10.
+    # target_unit_weight = 1.
+    # location_weight = 5.
+
+    selected_units_weight = 1.
+    target_unit_weight = 1.
+    location_weight = 1.
+
+    units_loss = selected_units_weight * criterion(gt_units.reshape(-1, units_size), units_logits.reshape(-1, units_size), 
+                                                   mask=all_units_mask, debug=False, outlier_remove=True, entity_nums=entity_nums,
+                                                   select_size=extended_select_size,
+                                                   select_units_num=select_units_num + 1)
+    loss += units_loss
+
+    target_unit_loss = target_unit_weight * criterion(action_gt.target_unit.squeeze(-2), target_unit_logits.squeeze(-2), 
+                                                      mask=mask_tensor[:, 4].reshape(-1), debug=False, outlier_remove=True, entity_nums=entity_nums)
+    target_unit_loss = target_unit_loss.mean()
+    target_unit_loss = (action_gt.target_unit.squeeze(-2).shape[0] / total_batch_size) * target_unit_loss
+    loss += target_unit_loss
+
+    batch_size = action_gt.target_location.shape[0]
+
+    target_location_loss = location_weight * criterion(action_gt.target_location.reshape(batch_size, -1),
+                                                       target_location_logits.reshape(batch_size, -1), mask=mask_tensor[:, 5].reshape(-1))
+    target_location_loss = target_location_loss.mean()
+    target_location_loss = (action_gt.target_location.reshape(batch_size, -1).shape[0] / total_batch_size) * target_location_loss
+    loss += target_location_loss
+
+    return loss, [action_type_loss.item(), delay_loss.item(), queue_loss.item(), units_loss.item(), target_unit_loss.item(), target_location_loss.item()]
+
+
+def get_classify_loss_for_multi_gpu(action_gt, action_type, delay, queue, units, target_unit, target_location, criterion):
+    loss = 0.
+
+    action_type_loss = criterion(action_gt.action_type, action_type)
+    loss += action_type_loss
+
+    delay_loss = criterion(action_gt.delay, delay)
+    loss += delay_loss
+
+    queue_loss = criterion(action_gt.queue, queue)
+    loss += queue_loss
+
+    units_size = action_gt.units.shape[-1]
+    units_loss = criterion(action_gt.units.reshape(-1, units_size), units.reshape(-1, units_size))
+    loss += units_loss
+
+    target_unit_loss = criterion(action_gt.target_unit.squeeze(-2), target_unit.squeeze(-2))
+    loss += target_unit_loss
+
+    batch_size = action_gt.target_location.shape[0]
+    target_location_loss = criterion(action_gt.target_location.reshape(batch_size, -1), target_location.reshape(batch_size, -1))
+    loss += target_location_loss
+
+    return loss, [action_type_loss.item(), delay_loss.item(), queue_loss.item(), units_loss.item(), target_unit_loss.item(), target_location_loss.item()]
